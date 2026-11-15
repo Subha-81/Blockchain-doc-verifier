@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Blockchain Document Verifier</title>
+<style>
+:root{--bg:#f7f7f5;--fg:#1d1d1b;--muted:#6b6b66;--card:#ffffff;--line:#dcdcd6;--ok:#1f7a3d;--bad:#b42318;--accent:#2d5be3;color-scheme:light}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#161615;--fg:#ecece8;--muted:#9a9a93;--card:#1f1f1d;--line:#38382f;--ok:#4cc27a;--bad:#ff7a6b;--accent:#7b9cff;color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#161615;--fg:#ecece8;--muted:#9a9a93;--card:#1f1f1d;--line:#38382f;--ok:#4cc27a;--bad:#ff7a6b;--accent:#7b9cff;color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--fg);padding:env(safe-area-inset-top,0px) 16px env(safe-area-inset-bottom,0px)}
+main{max-width:960px;margin:0 auto;padding:24px 0}
+h1{font-size:22px;margin:0 0 4px}
+h2{font-size:16px;margin:0 0 10px}
+p.lead{color:var(--muted);margin:0 0 20px}
+.grid{display:grid;gap:16px;grid-template-columns:1fr 1fr}
+@media (max-width:760px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px}
+textarea,input{width:100%;font:inherit;color:var(--fg);background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:8px}
+textarea{min-height:90px;resize:vertical}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin:10px 0}
+button{font:inherit;color:#fff;background:var(--accent);border:0;border-radius:6px;padding:8px 12px;cursor:pointer}
+button.secondary{background:transparent;color:var(--fg);border:1px solid var(--line)}
+button.danger{background:var(--bad)}
+button:disabled{opacity:.5;cursor:default}
+.mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;word-break:break-all}
+.muted{color:var(--muted);font-size:13px}
+.result{margin-top:10px;padding:10px;border-radius:6px;border:1px solid var(--line);min-height:44px}
+.valid{color:var(--ok);font-weight:600}
+.bad{color:var(--bad);font-weight:600}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:6px;border-bottom:1px solid var(--line);vertical-align:top}
+.wide{grid-column:1/-1}
+.scroll{overflow-x:auto}
+</style>
+</head>
+<body>
+<main>
+  <h1>Blockchain Document Verifier</h1>
+  <p class="lead">Issuers sign a document's SHA-256 hash and record it in a hash-linked chain. Anyone can check a document against the chain. Everything runs in your browser, and the chain resets when you reload the page.</p>
+
+  <div class="grid">
+    <section class="card">
+      <h2>1. Issuer: create key and issue a document</h2>
+      <div class="row"><button id="genKey">Generate issuer key pair</button></div>
+      <div class="muted" id="keyInfo">No issuer key yet.</div>
+      <textarea id="issueText" placeholder="Paste the document text, e.g. Certificate: Priya S. completed Blockchain Basics on 2026-10-01"></textarea>
+      <div class="row"><button id="issue" disabled>Sign and add to chain</button></div>
+      <div class="result" id="issueResult"></div>
+    </section>
+
+    <section class="card">
+      <h2>2. Verifier: check a document</h2>
+      <input id="blockNo" type="number" min="0" placeholder="Record number (block index)">
+      <div style="height:8px"></div>
+      <textarea id="verifyText" placeholder="Paste the document you received"></textarea>
+      <div class="row"><button id="verify">Verify</button></div>
+      <div class="result" id="verifyResult"></div>
+    </section>
+
+    <section class="card wide">
+      <h2>3. The chain</h2>
+      <div class="row">
+        <button class="secondary" id="validate">Validate chain</button>
+        <button class="danger" id="tamper">Tamper with record 0 (simulate an attacker)</button>
+        <button class="secondary" id="reset">Reset chain</button>
+      </div>
+      <div class="result" id="chainResult">Chain is empty.</div>
+      <div class="scroll"><table><thead><tr><th>#</th><th>Document hash</th><th>Signature</th><th>Block hash</th></tr></thead><tbody id="chainBody"></tbody></table></div>
+    </section>
+  </div>
+</main>
+
+<script>
+const state = { keys: null, pubJwk: null, chain: [] };
+const $ = id => document.getElementById(id);
+const enc = new TextEncoder();
+const GENESIS = "0".repeat(64);
+
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function toHex(buf){ return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2,"0")).join(""); }
+function fromHex(h){ return Uint8Array.from(h.match(/../g).map(x => parseInt(x,16))); }
+async function sha256(text){ return toHex(await crypto.subtle.digest("SHA-256", enc.encode(text))); }
+function blockBody(b){ return JSON.stringify([b.index, b.prev, b.docHash, b.sig, b.time]); }
+function short(h){ return h.slice(0,12) + "..."; }
+function show(el, html, ok){ el.innerHTML = html; el.dataset.state = ok === undefined ? "" : (ok ? "ok" : "bad"); }
+
+async function checkSig(b){
+  const key = await crypto.subtle.importKey("jwk", state.pubJwk, {name:"ECDSA", namedCurve:"P-256"}, false, ["verify"]);
+  return crypto.subtle.verify({name:"ECDSA", hash:"SHA-256"}, key, fromHex(b.sig), enc.encode(b.docHash));
+}
+
+async function validateChain(){
+  const issues = [];
+  let prev = GENESIS;
+  for (const b of state.chain){
+    if (b.prev !== prev) issues.push(`#${b.index}: broken link to previous block`);
+    if ((await sha256(blockBody(b))) !== b.blockHash) issues.push(`#${b.index}: block contents were altered`);
+    if (!(await checkSig(b))) issues.push(`#${b.index}: issuer signature does not verify`);
+    prev = b.blockHash;
+  }
+  return issues;
+}
+
+function renderChain(){
+  $("chainBody").innerHTML = state.chain.map(b =>
+    `<tr><td>${b.index}</td><td class="mono">${esc(short(b.docHash))}</td><td class="mono">${esc(short(b.sig))}</td><td class="mono">${esc(short(b.blockHash))}</td></tr>`
+  ).join("");
+  $("chainResult").textContent = state.chain.length ? `${state.chain.length} record(s) on chain.` : "Chain is empty.";
+  $("chainResult").dataset.state = "";
+}
+
+$("genKey").onclick = async () => {
+  state.keys = await crypto.subtle.generateKey({name:"ECDSA", namedCurve:"P-256"}, true, ["sign","verify"]);
+  state.pubJwk = await crypto.subtle.exportKey("jwk", state.keys.publicKey);
+  const fp = (await sha256(JSON.stringify(state.pubJwk))).slice(0,16);
+  $("keyInfo").textContent = `Issuer key ready. Public key fingerprint: ${fp}`;
+  $("issue").disabled = false;
+};
+
+$("issue").onclick = async () => {
+  const text = $("issueText").value.trim();
+  if (!text) return show($("issueResult"), "Enter a document first.", false);
+  const docHash = await sha256(text);
+  const sig = toHex(await crypto.subtle.sign({name:"ECDSA", hash:"SHA-256"}, state.keys.privateKey, enc.encode(docHash)));
+  const index = state.chain.length;
+  const prev = index ? state.chain[index-1].blockHash : GENESIS;
+  const time = new Date().toISOString();
+  const b = { index, prev, docHash, sig, time };
+  b.blockHash = await sha256(blockBody(b));
+  state.chain.push(b);
+  renderChain();
+  show($("issueResult"), `Recorded as record #${index}. Give the document and this number to the recipient.`, true);
+};
+
+$("verify").onclick = async () => {
+  const idx = parseInt($("blockNo").value, 10);
+  const text = $("verifyText").value;
+  const b = state.chain[idx];
+  if (Number.isNaN(idx) || !b) return show($("verifyResult"), "UNKNOWN: no such record on the chain.", false);
+  if ((await sha256(text)) !== b.docHash) return show($("verifyResult"), `<span class="bad">TAMPERED</span>: this document differs from what was signed in record #${idx}.`, false);
+  if (!(await checkSig(b))) return show($("verifyResult"), `<span class="bad">FORGED</span>: the issuer signature is invalid.`, false);
+  const issues = await validateChain();
+  if (issues.length) return show($("verifyResult"), `<span class="bad">WARNING</span>: the document matches, but the chain is damaged: ${esc(issues.join("; "))}`, false);
+  show($("verifyResult"), `<span class="valid">VALID</span>: hash matches, signature verifies, and the chain is intact.`, true);
+};
+
+$("validate").onclick = async () => {
+  if (!state.chain.length) return;
+  const issues = await validateChain();
+  $("chainResult").textContent = issues.length ? "Chain INVALID: " + issues.join("; ") : "Chain is intact.";
+  $("chainResult").dataset.state = issues.length ? "bad" : "ok";
+};
+
+$("tamper").onclick = async () => {
+  if (!state.chain.length) return $("chainResult").textContent = "Issue a record first.";
+  state.chain[0].docHash = await sha256("forged content");
+  renderChain();
+  $("chainResult").textContent = "Record 0 was altered directly in storage. Click Validate chain to detect it.";
+};
+
+$("reset").onclick = () => { state.chain = []; renderChain(); show($("issueResult"), "", undefined); show($("verifyResult"), "", undefined); };
+
+renderChain();
+</script>
+</body>
+</html>
